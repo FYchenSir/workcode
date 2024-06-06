@@ -1,0 +1,121 @@
+import os
+from datetime import date, datetime, time, timedelta
+from pyspark.sql import functions as F, Window
+from pyinfra.spark import get_or_create_spark,save_df_to_adb
+
+from pyinfra import pg_handle as pg_f
+
+
+
+def run():
+    """
+        大屏利润计算
+    """
+    _sql = """
+    SELECT fg.bill_account_statement_id, fg.fin_billdate, fg.flow, fg.bill_account_id, fg.bill_production_period_id
+        , fg.user_id, fg.state, fg.flow_level, fg.last_due_date, fg.cleared_time
+        , fg.bill_account_statement_repayment_id as bill_acct_stat_repayment_id, fg.product_name, fg.bill_type, fg.big_bill_type, fg.big_type
+        , fg.fin_bill_amount, fg.total_amount, fg.repayment, fg.service_fee, fg.late_fee
+        , fg.actual_amount, fg.xljrdb_customer_id, fg.open_time, fg.is_white, fg.cust_state
+        , CASE 
+            WHEN dpc.part_flag = '0' THEN 
+			CASE WHEN fg.loan_type = '贷款' THEN fg.fin_bill_amount*0.00049 + fg.service_fee * 
+			CAST(if(fg.fin_billdate>='2021-04-01 00:00:00',dpc.part_cost_4,dpc.part_cost) AS float)
+			ELSE fg.service_fee * CAST(if(fg.fin_billdate>='2021-04-01 00:00:00',dpc.part_cost_4,dpc.part_cost) AS float) END
+            WHEN dpc.part_flag = '1'
+                AND cr.pay_channel = 'ap_mybank_second_account'
+            THEN CASE WHEN fg.loan_type = '贷款' THEN fg.fin_bill_amount*0.00049 + cr.splited_amount * 
+            CAST(if(fg.fin_billdate>='2021-04-01 00:00:00',dpc.part_cost_4,dpc.part_cost) AS float)
+			ELSE cr.splited_amount * CAST(if(fg.fin_billdate>='2021-04-01 00:00:00',dpc.part_cost_4,dpc.part_cost) AS float) END
+            ELSE 0
+        END AS part_cb
+        , CASE 
+            WHEN dpc.channel_flag = '1'
+                AND cr.pay_channel = 'ap_xl_alipay'
+            THEN cr.splited_amount * CAST(dpc.channel_cost AS float)
+            ELSE 0
+        END AS channel_cb
+    FROM (
+        SELECT bill_account_statement_id, flow, count(1)
+        FROM dwd.fin_bill
+        WHERE billdate >= '2021-01-01 00:00:00'
+            AND card_type = 'ltk' and bz_month >= '202210'
+        GROUP BY bill_account_statement_id, flow
+    ) fb
+        JOIN dwd.fin_gather fg
+        ON fb.bill_account_statement_id = fg.bill_account_statement_id
+            AND fb.flow = fg.flow
+        LEFT JOIN (
+            SELECT business_id, pay_channel, sum(splited_amount) AS splited_amount
+            FROM ods.analysis_contrast_repayment
+            WHERE pay_channel IN ('ap_mybank_second_account', 'ap_xl_alipay')
+            GROUP BY business_id, pay_channel
+        ) cr
+        ON fg.bill_account_statement_id = cr.business_id
+        LEFT JOIN dwd.dic_product_cost dpc ON fg.product_name = dpc.product_name
+    """
+
+    spark.sql(_sql).write.mode('overwrite').saveAsTable("dwd.dwd_fin_cost")
+
+    _sql_2 = """
+    select sum(ta.balance_amount)/100 as amount,"交易中心_工行沉淀资金" as precipitate_money,'{}' as bz_date  from ods.trans_account ta
+      where ta.accno like 'BZ9%' or ta.accno  like '9%'
+      and ta.bank_name='ICBC'
+    union all
+    select sum(ta.balance_amount)/100 as amount,"交易中心_网商沉淀资金" as precipitate_money ,'{}' as bz_date from ods.trans_account ta
+      where ta.accno  like '5%'
+    union all
+    select sum(eb.ebankbalance) as amount,"e高速_网商沉淀资金" as precipitate_money,'{}' as bz_date from ods.ebank_balance eb
+    """.format(yesterday.strftime("%Y%m%d"), yesterday.strftime("%Y%m%d"), yesterday.strftime("%Y%m%d"))
+    try:
+        spark.sql(
+            "alter table dwd.dwd_fin_precipitate drop partition (bz_date={})".format(yesterday.strftime("%Y%m%d")))
+    except:
+        pass
+    spark.sql(_sql_2).write.mode('append').partitionBy("bz_date").format("hive").saveAsTable("dwd.dwd_fin_precipitate")
+
+    res = spark.table("dwd.dwd_fin_cost").groupBy(
+        F.to_date(F.col("fin_billdate")).alias("bz_date"), "big_bill_type") \
+        .agg(F.sum("service_fee").alias("service_fee"), F.sum("late_fee").alias("late_fee"),
+             F.sum("part_cb").alias("part_cb"), F.sum("channel_cb").alias("channel_cb")).where(
+        "big_bill_type is not null").alias("a") \
+        .select("a.*", (
+            F.col("service_fee") + F.when(F.col("late_fee").isNull(), 0).otherwise(F.col("late_fee")) - F.col(
+        "part_cb") - F.col("channel_cb")).alias("profit"),
+                F.lit("0").alias("cdzj"))
+    precipitate = spark.table("dwd.dwd_fin_precipitate") \
+        .groupBy(
+        F.to_date(F.from_unixtime(F.unix_timestamp(F.col("bz_date"), 'yyyymmdd'), 'yyyy-mm-dd')).alias("bz_date")) \
+        .agg(F.sum("amount").alias("cdzj")).select("bz_date", F.lit("预付卡").alias("big_bill_type"),
+                                                   F.lit(0).alias("service_fee"),
+                                                   F.lit(0).alias("late_fee"), F.lit(0).alias("part_cb"),
+                                                   F.lit(0).alias("channel_cb"),
+                                                   0.032 / 365 * F.col("cdzj").alias("profit"), F.col('cdzj'))
+    res.union(precipitate).write.mode('overwrite').saveAsTable("dwd.dws_fin_cost")
+    pg_f.create_pg_inner_table(spark, 'dws.dws_fin_cost', 'dwd.dws_fin_cost')
+
+def run_to_excel():
+    fin_cost = spark.table("dwd.dwd_fin_cost").where(
+        "fin_billdate = '{}'".format(str(yesterday))) \
+        .select('fin_billdate', 'flow', "big_bill_type", "fin_bill_amount", "product_name", "service_fee", "late_fee",
+                "part_cb", "channel_cb", (
+                        F.col("service_fee") + F.when(F.col("late_fee").isNull(), 0).otherwise(
+                    F.col("late_fee")) - F.col(
+                    "part_cb") - F.col("channel_cb")).alias("profit"),
+                F.lit("0").alias("cdzj"), F.lit(yesterday.strftime("%Y%m%d")).alias("bz_date")).toPandas()
+    fin_cost.to_excel("/home/hadoop/export_dir/利润明细-{}.xlsx".format(yesterday.strftime("%Y%m%d")), index=False)
+    os.system("scp /home/hadoop/export_dir/利润明细-{}.xlsx xlzf@web-bigdata-prod-02.xlkeji.local:/home/xlzf/excel_dir/".format(
+            yesterday.strftime('%Y%m%d')))
+
+if __name__ == '__main__':
+    spark = get_or_create_spark("dwd_fin_cost")
+    spark.conf.set("hive.exec.dynamic.partition", "true")
+    spark.conf.set("hive.exec.dynamic.partition.mode", "nonstrict")
+    today = date.today()
+    bz_date = datetime.combine(today, time(0, 0))
+    yesterday = bz_date - timedelta(days=1)
+    begin_time = datetime.now()
+    run()
+    run_to_excel()
+    end_time = datetime.now()
+    print("<<<<<总执行用时 ：{}s>>>>>".format((end_time - begin_time).total_seconds()))
